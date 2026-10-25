@@ -10,9 +10,10 @@
 #
 # Shape: writable local_fs mount on /tmp, mkdir a subfolder and
 # upload a file through the mount root (always worked), then pin
-# every SPA call on the `ext:` ids. Thumbnails of mount files are
-# the documented 204 ("no thumbnail") instead of 404; metadata is
-# the "no EXIF" body. A stranger is denied as 404 (anti-enum).
+# every SPA call on the `ext:` ids. Image files render an on-demand
+# thumbnail (200 image/*); non-image files keep the documented 204
+# ("no thumbnail"); metadata is the "no EXIF" body. A stranger is
+# denied as 404 (anti-enum).
 # Cleanup removes the created entries (mounts have no trash).
 #
 # Requires OXICLOUD_ENABLE_EXTERNAL_MOUNTS=true (server.env).
@@ -124,6 +125,39 @@ Authorization: Bearer {{token}}
 HTTP 200
 [Asserts]
 jsonpath "$.message" == "No EXIF metadata available"
+
+
+# ─────────────────────────────────────────────────────────────
+# Mount IMAGE file: on-demand thumbnail from the provider stream.
+# ─────────────────────────────────────────────────────────────
+POST {{base_url}}/api/files/upload
+Authorization: Bearer {{token}}
+[MultipartFormData]
+folder_id: {{sub_id}}
+file: file,fixtures/red-image.png; image/png
+
+HTTP 201
+[Captures]
+image_id: jsonpath "$.id"
+[Asserts]
+jsonpath "$.id" startsWith "ext:"
+
+
+GET {{base_url}}/api/files/{{image_id}}/thumbnail/preview
+Authorization: Bearer {{token}}
+
+HTTP 200
+[Asserts]
+header "Content-Type" startsWith "image/"
+header "Content-Length" != "0"
+header "Cache-Control" contains "private"
+
+
+# Cleanup the mount image (permanent inside a mount).
+DELETE {{base_url}}/api/files/{{image_id}}
+Authorization: Bearer {{token}}
+
+HTTP *
 
 
 # ─────────────────────────────────────────────────────────────

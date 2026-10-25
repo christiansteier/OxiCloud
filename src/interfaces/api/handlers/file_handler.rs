@@ -552,6 +552,10 @@ impl FileHandler {
     /// way and must not drift from this policy.
     pub(crate) const THUMBNAIL_CACHE_CONTROL: &'static str = "private, no-cache";
 
+    /// Upper bound for reading a mount file into RAM for on-demand thumbnail
+    /// generation. Larger files keep the documented 204 type-icon fallback.
+    const MOUNT_THUMBNAIL_MAX_SOURCE_BYTES: u64 = 64 * 1024 * 1024;
+
     /// Get a thumbnail for a file (image or video).
     ///
     /// **Cache-first**: once past the hash lookup below, a thumbnail already
@@ -599,17 +603,6 @@ impl FileHandler {
             Err(err) => return AppError::from(err).into_response(),
         };
 
-        // External mount files have no blob and no thumbnail pipeline yet:
-        // answer the documented "no thumbnail for this file" 204 instead of
-        // letting the blob lookup below 404 (#793). The SPA shows the type
-        // icon for 204.
-        if matches!(
-            state.mount_router.classify(&id),
-            ResolvedId::MountChild { .. }
-        ) {
-            return StatusCode::NO_CONTENT.into_response();
-        }
-
         let thumbnail_service = &state.core.thumbnail_service;
 
         let thumb_size = match size.as_str() {
@@ -632,6 +625,17 @@ impl FileHandler {
         // WebP body to a JPEG-only client (or vice-versa).
         let format =
             ThumbnailFormat::from_accept(headers.get(header::ACCEPT).and_then(|v| v.to_str().ok()));
+
+        // External-mount files have no blob, so the blob-keyed pipeline below
+        // cannot serve them. Generate an on-demand thumbnail from the provider
+        // stream instead — images only; videos and other types keep the
+        // documented 204 type-icon fallback (#793).
+        if let ResolvedId::MountChild { cfg, node_id } = state.mount_router.classify(&id) {
+            return Self::thumbnail_for_mount_file(
+                &state, &cfg, &node_id, &id, authorized_as, thumb_size, format, headers,
+            )
+            .await;
+        }
 
         // ── ETag short-circuit ───────────────────────────────────────
         // Keyed on the CONTENT served, not the file id.
@@ -843,6 +847,155 @@ impl FileHandler {
             Err(err) => AppError::internal_error(format!("Thumbnail generation failed: {}", err))
                 .into_response(),
         }
+    }
+
+    /// Thumbnail for a file living inside an external mount.
+    ///
+    /// Mount files have no blob hash, so the content-keyed thumbnail tiers
+    /// cannot address them. Instead we render on demand from the provider
+    /// stream and cache in RAM under an identity key built from
+    /// `(mount, node, size, mtime)` — any underlying edit changes the key, so
+    /// a stale thumbnail can never be served for new content. Images only;
+    /// videos and other types answer the documented 204 (type icon).
+    #[allow(clippy::too_many_arguments)]
+    async fn thumbnail_for_mount_file(
+        state: &AppState,
+        cfg: &MountConfig,
+        node_id: &NodeId,
+        id: &str,
+        authorized_as: Subject,
+        size: crate::application::ports::thumbnail_ports::ThumbnailSize,
+        format: crate::application::ports::thumbnail_ports::ThumbnailFormat,
+        headers: &HeaderMap,
+    ) -> axum::response::Response {
+        let Some(caller_id) = authorized_as.user_id() else {
+            return AppError::not_found("File not found").into_response();
+        };
+        let retrieval = &state.applications.file_retrieval_service;
+        let stat: MountStat = match retrieval
+            .stat_mount_file_with_perms(cfg, node_id, caller_id)
+            .await
+        {
+            Ok(s) => s,
+            Err(err) => return AppError::from(err).into_response(),
+        };
+        if stat.is_dir {
+            return AppError::from(DomainError::not_found("File", id)).into_response();
+        }
+
+        let thumbnail_service = &state.core.thumbnail_service;
+        if !thumbnail_service.is_supported_image(&stat.mime_type)
+            || stat.size > Self::MOUNT_THUMBNAIL_MAX_SOURCE_BYTES
+        {
+            return StatusCode::NO_CONTENT.into_response();
+        }
+
+        // Identity key: no blob hash exists, so pin the thumbnail to the
+        // observable identity of the underlying file.
+        let mount_key = blake3::hash(
+            format!(
+                "ext:{}:{}:{}:{}",
+                cfg.mount_id.simple(),
+                node_id.as_str(),
+                stat.size,
+                stat.modified_at
+            )
+            .as_bytes(),
+        )
+        .to_hex()
+        .to_string();
+
+        let etag = format!(
+            "\"{}\"",
+            thumbnail_service
+                .thumbnail_content_id(id, &mount_key, size.into(), format, None)
+                .await
+        );
+
+        if let Some(if_none_match) = headers.get(header::IF_NONE_MATCH)
+            && let Ok(val) = if_none_match.to_str()
+            && (val == etag || val == "*")
+        {
+            return Response::builder()
+                .status(StatusCode::NOT_MODIFIED)
+                .header(header::ETAG, &etag)
+                .header(header::VARY, header::ACCEPT.as_str())
+                .header(header::CACHE_CONTROL, Self::THUMBNAIL_CACHE_CONTROL)
+                .body(Body::empty())
+                .unwrap()
+                .into_response();
+        }
+
+        // RAM-only cache: there is no blob to hang a durable derived key on,
+        // so an evicted or restarted cache re-renders on next access.
+        if let Some(data) = thumbnail_service
+            .get_cached_thumbnail(id, Some(&mount_key), size.into(), format, None)
+            .await
+        {
+            return Response::builder()
+                .status(StatusCode::OK)
+                .header(
+                    header::CONTENT_TYPE,
+                    crate::common::mime_detect::thumbnail_content_type(&data),
+                )
+                .header(header::CONTENT_LENGTH, data.len())
+                .header(header::CACHE_CONTROL, Self::THUMBNAIL_CACHE_CONTROL)
+                .header(header::ETAG, &etag)
+                .header(header::VARY, header::ACCEPT.as_str())
+                .body(Body::from(data))
+                .unwrap()
+                .into_response();
+        }
+
+        let bytes = match Self::read_mount_file_bytes(retrieval, cfg, node_id, caller_id, stat.size)
+            .await
+        {
+            Ok(b) => b,
+            Err(err) => return AppError::from(err).into_response(),
+        };
+
+        match thumbnail_service
+            .get_thumbnail_from_bytes(id, &mount_key, size.into(), format, bytes)
+            .await
+        {
+            Ok(data) => Response::builder()
+                .status(StatusCode::OK)
+                .header(
+                    header::CONTENT_TYPE,
+                    crate::common::mime_detect::thumbnail_content_type(&data),
+                )
+                .header(header::CONTENT_LENGTH, data.len())
+                .header(header::CACHE_CONTROL, Self::THUMBNAIL_CACHE_CONTROL)
+                .header(header::ETAG, &etag)
+                .header(header::VARY, header::ACCEPT.as_str())
+                .body(Body::from(data))
+                .unwrap()
+                .into_response(),
+            Err(err) => AppError::internal_error(format!("Thumbnail generation failed: {}", err))
+                .into_response(),
+        }
+    }
+
+    /// Read a mount file fully into memory for on-demand thumbnail generation.
+    /// Bounded by the caller (see `MOUNT_THUMBNAIL_MAX_SOURCE_BYTES`).
+    async fn read_mount_file_bytes(
+        retrieval: &crate::application::services::file_retrieval_service::FileRetrievalService,
+        cfg: &MountConfig,
+        node_id: &NodeId,
+        caller_id: uuid::Uuid,
+        capacity: u64,
+    ) -> Result<Bytes, DomainError> {
+        use futures::StreamExt;
+        let mut stream = retrieval
+            .open_mount_file_with_perms(cfg, node_id, caller_id, None)
+            .await?;
+        let mut buf = bytes::BytesMut::with_capacity(capacity as usize);
+        while let Some(chunk) = stream.next().await {
+            buf.extend_from_slice(&chunk.map_err(|e| {
+                DomainError::internal_error("File", format!("Stream read error: {}", e))
+            })?);
+        }
+        Ok(buf.freeze())
     }
 
     // ═══════════════════════════════════════════════════════════════════════
